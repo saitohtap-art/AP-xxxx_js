@@ -1,1 +1,1 @@
-# AP-xxxx_js
+# AP機器サンプル プログラム　JavaScript
