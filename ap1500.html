@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AP-1500 Web Serial Controller</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 2em;
+        }
+        #controls button {
+            padding: 10px 15px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #log-container {
+            margin-top: 1em;
+            border: 1px solid #ccc;
+            padding: 1em;
+            height: 400px;
+            overflow-y: scroll;
+            background-color: #f9f9f9;
+        }
+        /* preタグは整形済みテキストなので、ホワイトスペースを維持する */
+        #log {
+            margin: 0;
+            white-space: pre-wrap; /* 自動で折り返す */
+            word-wrap: break-word; /* 長い単語も折り返す */
+        }
+    </style>
+</head>
+<body>
+
+    <h1>AP-1500 テスト</h1>
+    <p>
+        <strong>対応ブラウザ:</strong> Google Chrome, Microsoft Edge<br>
+        通信設定を選択後に「接続」ボタンを押して、シリアルポートを選択してください。
+    </p>
+    <div id="settings">
+        <select id="baudRateSelect">
+            <option value="4800">4800</option>
+            <option value="9600">9600</option>
+            <option value="19200">19200</option>
+            <option value="38400" selected>38400</option>
+            <option value="57600">57600</option>
+            <option value="115200">115200</option>
+        </select>bps
+        <select id="bitParityStopSelect">
+            <option value="8N1">8N1</option>
+            <option value="8E1">8E1</option>
+            <option value="8O1">8O1</option>
+            <option value="7N1">7N1</option>
+            <option value="7E1">7E1</option>
+            <option value="7O1">7O1</option>
+        </select>フロー制御
+        <select id="flowSelect">
+            <option value="none">None</option>
+            <option value="hardware">Hard</option>
+        </select>
+    </div>
+    <br>
+    <div id="controls">
+        <button id="connectButton">接続</button>
+        <button id="disconnectButton" disabled>切断</button>
+    </div>
+
+    <div id="log-container">
+        <pre id="log">ここにログが表示されます...</pre>
+    </div>
+
+    <script>
+        // DOM要素の取得
+        const connectButton = document.getElementById('connectButton');
+        const disconnectButton = document.getElementById('disconnectButton');
+        const logElement = document.getElementById('log');
+
+        //######################################## コマンド設定
+        // TextEncoderを使って文字列をUint8Arrayに変換する
+        const textEncoder = new TextEncoder();
+        const I_COMM = textEncoder.encode('IF');
+        const CMD_R = textEncoder.encode('R');
+        const CMD_F = textEncoder.encode('F');
+
+        let port;
+        let writer;
+        let reader;
+        let keepReading = true; // 読み取りループを制御するフラグ
+
+        // ログ出力関数
+        function log(text) {
+            // 元のPythonコードは改行を含めて受信するため、
+            // そのまま表示すると改行が重複する可能性がある。
+            // 末尾の改行を削除してから、<pre>タグに追加する。
+            logElement.textContent += text;
+            logElement.scrollTop = logElement.scrollHeight; // 自動スクロール
+        }
+
+        // 接続処理
+        connectButton.addEventListener('click', async () => {
+            if (!("serial" in navigator)) {
+                alert("お使いのブラウザは Web Serial API に対応していません。");
+                return;
+            }
+
+            try {
+                // ユーザーにポートを選択させる
+                port = await navigator.serial.requestPort();
+                
+                //通信設定
+                let baud = document.getElementById('baudRateSelect').value;
+                let bit = document.getElementById('bitParityStopSelect').value.charAt(0);
+                let pari = "none";
+                switch (document.getElementById('bitParityStopSelect').value.charAt(1)) {
+                    case "E":
+                        pari = "even";
+                        break;
+                    case "O":
+                        pari = "odd";
+                        break;
+                }
+                let flow = document.getElementById('flowSelect').value;
+
+                // ポートを開く
+                await port.open({ baudRate: Number(baud), dataBits: Number(bit), stopBits: 1, parity: pari, flowControl: flow, bufferSize: 255 });
+                log('\n＜処理開始＞\nポートに接続しました。\n');
+
+                // 制御線RTS/DTRオン
+                port.setSignals({ requestToSend: true, dataTerminalReady: true });
+
+                // UIの更新
+                connectButton.disabled = true;
+                disconnectButton.disabled = false;
+                
+                // 装置リセット送信
+                writer = port.writable.getWriter();
+                await writer.write(I_COMM);
+
+                // 読み取りループを開始
+                keepReading = true;
+                readLoop();
+
+            } catch (error) {
+                log(`エラー: ${error.message}\n`);
+            }
+        });
+
+        // 切断処理
+        disconnectButton.addEventListener('click', async () => {
+            keepReading = false; // 読み取りループを停止
+            
+            // Writerを解放
+            if (writer) {
+                // writer.close()やwriter.abort()はストリーム全体を閉じてしまう
+                // writer.releaseLock()のみでOK
+                writer.releaseLock();
+            }
+
+            // Readerをキャンセルして解放
+            if (reader) {
+                await reader.cancel();
+                // reader.releaseLock()はcancel()内で自動的に呼ばれる
+            }
+
+            // ポートを閉じる
+            if (port) {
+                await port.close();
+                port = undefined;
+            }
+            
+            // UIの更新
+            connectButton.disabled = false;
+            disconnectButton.disabled = true;
+            log('\n＜処理終了＞\nポートを切断しました。\n');
+        });
+
+        // データ読み取りループ
+        async function readLoop() {
+            // Shift_JISをデコードするためのTextDecoder
+            const sjisDecoder = new TextDecoder('shift-jis');
+            let receiveBuffer = new Uint8Array(0);
+
+            while (port && port.readable && keepReading) {
+                reader = port.readable.getReader();
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            // reader.cancel() が呼ばれた場合
+                            break;
+                        }
+
+                        // 受信データをバッファに追加
+                        const newBuffer = new Uint8Array(receiveBuffer.length + value.length);
+                        newBuffer.set(receiveBuffer);
+                        newBuffer.set(value, receiveBuffer.length);
+                        receiveBuffer = newBuffer;
+
+                        // 受信データに終端文字(CR)が含まれているか確認 (0x0d = CR)
+                        let crIndex;
+                        while ((crIndex = receiveBuffer.indexOf(0x0d)) !== -1) {
+                            const message = receiveBuffer.slice(0, crIndex + 1);
+                            receiveBuffer = receiveBuffer.slice(crIndex + 1);
+                            
+                            // メッセージを処理
+                            await processMessage(message, sjisDecoder);
+                        }
+                    }
+                } catch (error) {
+                    log(`読み取りエラー: ${error.message}\n`);
+                } finally {
+                    reader.releaseLock();
+                }
+            }
+        }
+        
+        // メッセージ処理関数
+        async function processMessage(data_rcv, decoder) {
+            const data_len = data_rcv.length - 1; // CRを除くデータ長
+            const data_txt = decoder.decode(data_rcv);
+            log(data_txt); // 受信した生データをログに出力
+
+            // 電源投入直後のデータ回避 (ESC P CR)
+            if (data_len >= 2 && data_rcv[data_len - 1] === 0x50 && data_rcv[data_len - 2] === 0x1b) {
+                data_rcv = new Uint8Array([0x1b, 0x50, 0x0d]); // ESC P CR に書き換え
+            }
+
+            // ステータス確認 (先頭がESC)
+            if (data_len >= 1 && data_rcv[0] === 0x1b) {
+                const statusChar = String.fromCharCode(data_rcv[1]);
+                switch (statusChar) {
+                    case 'P': log(':POWER ON\n'); await writer.write(I_COMM); break;
+                    case 'C': log(':COM error\n'); await writer.write(I_COMM); break;
+                    case 'U': log(':JAM error\n'); await writer.write(I_COMM); break;
+                    case 'D': log(':DBL error\n'); await writer.write(I_COMM); break;
+                    case '?': log(':Read error\n'); await writer.write(CMD_R); break;
+                    case '0': await writer.write(CMD_F); break; // ESC 0 CR はログなしで応答
+                    default: log(':STS error\n'); break;
+                }
+            } else if (data_len > 0) {
+                // 読み取りデータ処理
+                log(':Read OK\n');
+                await writer.write(CMD_F);
+            }
+        }
+    </script>
+
+</body>
+</html>

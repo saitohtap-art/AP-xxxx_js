@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+  	<meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AP-3100シリーズ</title>
+<script>
+//Webサーバーから Web Serial API を使用する場合には https での接続が必要です。
+let port, reader;  //シリアル通信用オブジェクト
+let openFlag = false;  //ポートオープン用フラグ
+let receiveBytes = new Array();  //受信データ バイト列
+let receiveStr = "";  //受信データ 文字列
+let qrDataStr = "";  //QR読取データ
+let rfidDataStr = "";  //RFID読取データ
+let readMode = 0;  //読取モード（QR:0 RFID:1 QR+RFID:2）
+let readCommand = "F\r";  //読取開始コマンド
+let rfidCommand = "FU0000\r";  //RFID読取コマンド
+let digits = 0;  //桁数チェック（しない:0 する:桁数1～9999）
+let digitsFlag = false;  //桁数チェック結果フラグ
+let duplicate = 0;  //重複チェック（しない:0 エラー:1 無視:2）
+let duplicateFlag = false;  //重複チェック結果フラグ
+let settingCommands = new Array();  //動作設定コマンド
+let settingCmdCount = 0;  //動作設定コマンド送信時work
+let runningFlag = false;  //処理実行中フラグ
+let initFlag = true;  //処理開始直後フラグ（動作設定コマンド送信用）
+let readCount = 0;  //1メディアでの読取回数（QR+RFIDまたはRFIDで複数回読書する際に使用）
+let readOkCount = 0;  //読取OK枚数
+let readErrCount = 0;  //読取エラー枚数
+let debugFlag = false;  //デバッグモード
+
+//各種設定
+function settingAllChange() {
+    if (document.getElementById('settingAll').checked) {
+        document.getElementById('settingAllDisp').style.display = 'block';
+    } else {
+        document.getElementById('settingAllDisp').style.display = 'none';
+    }
+}
+
+//読取設定 モード
+function modeChange() {
+    switch (document.getElementById('mode').value) {
+        case "0":
+            readMode = 0;
+            readCommand = "F\r";
+            break;
+        case "1":
+            readMode = 1;
+            readCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+            break;
+        default:
+            readMode = 2;
+            readCommand = "F\r";
+            rfidCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+    }
+    if (readMode > 0) {
+        document.getElementById('rfidDisp').style.display = "block";
+        if (readMode == 2) {
+            document.getElementById('delimiterDisp').style.display = "";
+        } else {
+            document.getElementById('delimiterDisp').style.display = "none";
+        }
+    } else {
+        document.getElementById('rfidDisp').style.display = "none";
+    }
+}
+
+//桁数
+function digitsChange() {
+    digits = Number(document.getElementById('digits').value);
+}
+
+//重複エラー
+function duplicateErrChange() {
+    if (document.getElementById('duplicateErr').checked) {
+        document.getElementById('duplicateIgnore').checked = false;
+        duplicate = 1;
+    } else {
+        duplicate = 0;
+    }
+}
+
+//重複無視
+function duplicateIgnoreChange() {
+    if (document.getElementById('duplicateIgnore').checked) {
+        document.getElementById('duplicateErr').checked = false;
+        duplicate = 2;
+    } else {
+        duplicate = 0;
+    }
+}
+
+//SJISエンコード用テーブル作成
+const table = { '\u00a5': 0x5c, '\u203e': 0x7e, '\u301c': 0x8160 };
+const sjisDecoder = new TextDecoder('shift-jis');
+for (let i = 0x81; i <= 0xfc; i++) {
+    if (i <= 0x84 || i >= 0x87 && i <= 0x9f || i >= 0xe0 && i <= 0xea || i >= 0xed && i <= 0xee || i >= 0xfa) {
+        for (let j = 0x40; j <= 0xfc; j++) {
+            const c = sjisDecoder.decode(new Uint8Array([i, j]));
+            if (c.length === 1 && c !== '\ufffd' && !table[c]) {
+                table[c] = i << 8 | j;
+            }
+        }
+    }
+}
+
+//SJISエンコード処理
+function sjisEncode(content) {
+    let buffer = [];
+    for (let i = 0; i < content.length; i++) {
+        const c = content.codePointAt(i);
+        if (c > 0xffff) {
+            i++;
+        }
+        if (c < 0x80) {
+            buffer.push(c);
+        }
+        else if (c >= 0xff61 && c <= 0xff9f) {
+            buffer.push(c - 0xfec0);
+        }
+        else {
+            const d = table[String.fromCodePoint(c)] || 0x3f;
+            if (d > 0xff) {
+                buffer.push(d >> 8 & 0xff, d & 0xff);
+            }
+            else {
+                buffer.push(d);
+            }
+        }
+    }
+    return Uint8Array.from(buffer);
+}
+
+//RFID読取設定
+function rfidChange() {
+    if (readMode == 1) {
+        readCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+    } else {
+        rfidCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+    }
+}
+
+//UID
+function uidChange() {
+    if (readMode == 1) {
+        if (document.getElementById('uid').checked) {
+            readCommand = "FU\r";
+        } else {
+            readCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+        }
+    } else {
+        if (document.getElementById('uid').checked) {
+            rfidCommand = "FU\r";
+        } else {
+            rfidCommand = "FU" + document.getElementById('start').value.padStart(2, '0') + document.getElementById('block').value.padStart(2, '0') + "\r";
+        }
+    }
+}
+
+//動作設定コマンド
+function commandChange() {
+    if (document.getElementById('command').value == "") {
+        settingCommands.length = 0;
+    } else {
+        settingCommands = document.getElementById('command').value.replaceAll("\\r", "\r").split(",");
+    }
+    settingCmdCount = 0;
+}
+
+//Send
+function sendClick() {
+    if (settingCommands.length > 0) {
+        if (!initFlag) {
+            initFlag = true;
+            settingCmdCount = 0;
+        }
+        startCommand();
+    }
+}
+
+//拡張機能
+function addonSelectChange() {
+    var filePath = document.getElementById('addonSelect').value;
+    if (filePath != "") {
+        var script = document.createElement('script');
+        script.src = filePath;
+        document.head.appendChild(script);  //<head>タグに生成
+        //document.body.appendChild(script);  //<body>タグに生成
+        document.getElementById('addonSelect').disabled = true;  //変更不可
+    }
+}
+
+//自動スタート
+function autoClick() {
+    runningFlag = true;
+    readCommand = "A" + readCommand.slice(1);
+    initFlag = true;
+    settingCmdCount = 0;
+    sendCommand("I\r");
+}
+
+//手動スタート
+function manualClick() {
+    runningFlag = true;
+    readCommand = "F" + readCommand.slice(1);
+    initFlag = true;
+    settingCmdCount = 0;
+    addStatus("メディアをセットしてスタートキーを押してください。\n");
+    sendCommand("I\r");
+}
+
+//停止
+function stopClick() {
+    runningFlag = false;
+    sendCommand("I\r");
+}
+
+//データ編集
+function readDataEditChange() {
+    if (document.getElementById('readDataEdit').checked) {
+        document.getElementById('readDataArea').readOnly = false;
+    } else {
+        document.getElementById('readDataArea').readOnly = true;
+    }
+}
+
+//読取データ テキストエリア書き込み
+function addReadData(msg) {
+    var textarea = document.getElementById('readDataArea');
+    textarea.value += msg;
+    textarea.scrollTop = textarea.scrollHeight;  //最下行表示
+}
+
+//読取データ出力
+function outputClick() {
+    const output = document.querySelector('#readDataArea').value;  //読取データエリア指定
+    if (output != "") {
+        const blob = new Blob([output], { type: "text/plain"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        //現在日時 yyyymmddhhmmss
+        const now = new Date().toLocaleDateString('sv-SE', {year: 'numeric', month: '2-digit', day: '2-digit',  hour: '2-digit', minute: '2-digit', second: '2-digit'}).replace(/[\s:-]/g, '');
+        a.download = "ReadData" + now + ".csv";  //ファイル名
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+}
+
+//ステータクリア
+function statusClearClick() {
+    var statusText = document.getElementById('statusArea').value = "";
+}
+
+//ステータスログ テキストエリア書き込み
+function addStatus(msg) {
+    var statusText = document.getElementById('statusArea');
+    statusText.value += msg;
+    statusText.scrollTop = statusText.scrollHeight;  //最下行表示
+}
+
+//デバッグモード
+function debugChange() {
+    if (document.getElementById('debug').checked) {
+        document.getElementById('debugArea').style.display = 'block';
+        debugFlag = true;
+    } else {
+        document.getElementById('debugArea').style.display = 'none';
+        debugFlag = false;
+    }
+}
+
+//Receive
+function receiveClick() {
+    var HeadChar = document.getElementById('receiveHead').value;
+    if (HeadChar == "") {
+        receiveStr = document.getElementById('receive').value + "\r";
+    } else {
+        receiveStr = String.fromCharCode(Number("0x" + document.getElementById('receiveHead').value)) + document.getElementById('receive').value + "\r";
+    }
+    if (receiveStr != "\r") status2Command();
+}
+
+//Port Open
+async function openClick() {
+    if (openFlag) return; 
+
+    //シリアルポート選択
+    try {
+        port = await navigator.serial.requestPort();  //シリアルデバイス選択
+    } catch (e) {
+        addStatus("シリアルポートを選択してください。\n");
+        return;
+    }
+
+    //通信設定
+    let baud = document.getElementById('baudRateSelect').value;
+    let bit = document.getElementById('bitParityStopSelect').value.charAt(0);
+    let pari = "none";
+    switch (document.getElementById('bitParityStopSelect').value.charAt(1)) {
+        case "E":
+            pari = "even";
+            break;
+        case "O":
+            pari = "odd";
+            break;
+    }
+    let flow = document.getElementById('flowSelect').value;
+
+    //シリアルポートオープン
+    try {
+        await port.open({ baudRate: Number(baud), dataBits: Number(bit), parity: pari, stopBits: 1, flowControl: flow, bufferSize: 255 });
+        addStatus("シリアルポート オープン\n");
+    } catch (e) {
+        addStatus("シリアルポート オープンエラー: " + e + "\n");
+        return;
+    }
+    openFlag = true;
+
+    //信号線
+    port.setSignals({ dataTerminalReady: true });  //信号線DSRをON
+    port.setSignals({ requestToSend: true });  //信号線RTSをON
+
+    //シリアルデータ受信
+    while (port.readable) {
+        reader = port.readable.getReader();  //リーダの取得・ロック
+        while (true) {
+            try {
+                const { value, done } = await reader.read();  //データ受信
+                if (done) break;  //cancelされた
+                //addStatus(Array.from(value).map(byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ') + "\n");  //受信データ16進数表示
+                receiveBytes.push(...value);
+                if (value[value.length - 1] != 0x0d) continue;  //末尾CRまで受信
+                //文字列デコード
+                if (document.getElementById('encode').value == "SJIS") {
+                    receiveStr = new TextDecoder('shift-jis').decode(new Uint8Array(receiveBytes));  //SJIS（Windows拡張文字対応 'cp932'）
+                } else {
+                    receiveStr = new TextDecoder('utf8').decode(new Uint8Array(receiveBytes));  //UTF8
+                }
+                status2Command();  //ステータス処理へ
+                receiveBytes.length = 0; //クリア
+            } catch (e) {
+                addStatus(e + "\n");
+                break;
+            }
+        }
+        reader.releaseLock();  //リーダの解放
+        await port.close();  //シリアルポート クローズ
+        addStatus("シリアルポート クローズ\n");
+        openFlag = false;
+    }
+}
+
+//シリアルデータ送信
+async function sendSerial(sendText) {
+    const writer = port.writable.getWriter();  //ライタの取得・ロック
+    if (document.getElementById('encode').value == "SJIS") {
+        await writer.write(sjisEncode(sendText));  //SJISエンコード後に送信
+    } else {
+        await writer.write(new TextEncoder().encode(sendText));  //UTF8エンコード後に送信
+    }
+    writer.releaseLock();  //ライタの解放
+}
+
+//コマンド送信
+function sendCommand(sendText) {
+    addStatus("送信：" + sendText);
+    if (!debugFlag) sendSerial(sendText);
+}
+
+//シリアルデバイスが接続された際のイベント
+navigator.serial.addEventListener('connect', e => {
+  addStatus("シリアルケーブルが接続されました。再度シリアルポートをオープンしてください。\n");
+});
+
+//シリアルデバイスが切断された際のイベント
+navigator.serial.addEventListener('disconnect', e => {
+  addStatus("シリアルケーブルが切断されました。\n");
+});
+
+//Close
+function closeClick() {
+    if (!openFlag) return;
+    try {
+        reader.cancel();  //readerをcancel
+    } catch (e) {
+        addStatus(e + "\n");
+    }
+}
+
+//読取開始コマンド処理
+function startCommand() {
+    if (initFlag && settingCommands.length > 0) {
+        //スタートボタン、機器電源ON、sendボタンでの送信
+        sendCommand(settingCommands[settingCmdCount++]);
+        if (settingCmdCount >= settingCommands.length) initFlag = false;
+    } else {
+        //読取処理中の送信
+        readCount = 0;
+        sendCommand(readCommand);
+    }
+}
+
+//読取データチェック処理
+function readDataChk() {
+    readCount++;
+    switch (readMode) {
+        case 0:  //QR
+            qrDataStr = receiveStr;  //QR読取データ
+            break;
+        case 1:  //RFID
+            rfidDataStr = receiveStr;  //RFID読取データ
+            break;
+        default:  //QR+RFID
+            if (readCount == 1) {
+            qrDataStr = receiveStr;
+                sendCommand(rfidCommand);
+                return;
+            }
+            rfidDataStr = receiveStr;
+            receiveStr = qrDataStr + document.getElementById('delimiter').value + rfidDataStr;  //QRデータとRFIDデータ連結
+    }
+
+    digitsFlag = false;
+    duplicateFlag = false;
+
+    //桁数チェック
+    if (digits > 0) {
+        if (receiveStr.length != digits) {
+            digitsFlag = true;
+            readErr();  //読取エラー時の処理へ
+            return;
+        }
+    }
+
+    //重複チェック
+    if (duplicate > 0) {
+        if (("\n" + document.getElementById('readDataArea').value).indexOf("\n" + receiveStr + "\n") >= 0) {  //先頭、末尾をLFコード追加して検索
+            duplicateFlag = true;
+            if (duplicate == 1) {
+                readErr();  //読取エラー時の処理へ
+                return;
+            }
+        }
+    }
+    readOk();
+}
+
+//読取OK時の処理
+function readOk() {
+    if (duplicateFlag) {
+        addStatus("重複データが存在します。データを無視してOK排出します。\n");
+    } else {
+        addReadData(receiveStr + "\n");  //読取データ追加
+        document.getElementById('readOk').value = String(++readOkCount);  //OKカウント
+    }
+    sendCommand("P00\r");  //正常排出
+}
+
+//読取エラー時の処理
+function readErr() {
+    if (digitsFlag == 1) addStatus("データの桁数が異なるため、エラー排出します。\n");
+    if (duplicateFlag == 1) addStatus("重複データが存在するため、エラー排出します。\n");
+    document.getElementById('readErr').value = String(++readErrCount);  //ERRカウント
+    sendCommand("P01\r");  //エラー排出
+}
+
+//ステータス処理
+function status2Command() {
+    receiveStr = receiveStr.slice(0, -1);  //末尾CRコード削除
+    addStatus("受信：" + receiveStr + "\n");
+    let dataLen = receiveStr.length;  //データサイズ
+    if (runningFlag) {
+        if (dataLen >= 2) {
+            //電源ONステータス処理 ※機器の電源投入時ノイズデータを無視する
+            if (receiveStr[dataLen - 2] == "\x1b" && receiveStr[dataLen - 1] == "P") {  //データ末尾で ESC P 確認
+                addStatus("機器の電源が投入されました。\n");
+                initFlag = true;
+                settingCmdCount = 0;
+                sendCommand("I\r");
+            } else if (receiveStr[0] == "\x1b") {  //ESC
+                //ステータス処理
+                switch (receiveStr[1]) {
+                    case "0":  //正常応答
+                        startCommand();
+                        break;
+                    case "?":
+                        addStatus("読取エラー\n");
+                        readErr();
+                        break;
+                    case "C":
+                        addStatus("コマンドエラー\n");
+                        sendCommand("I\r");
+                        break;
+                    case "J":
+                        addStatus("ジャムエラー\n");
+                        sendCommand("I\r");
+                        break;
+                    case "D":
+                        addStatus("ダブルフィードエラー\n");
+                        sendCommand("I\r");
+                        break;
+                    case "H":
+                        addStatus("ホッパーエンプティ\nメディアをセットしてスタートキーを押してください。\n");
+                        sendCommand("F" + readCommand.slice(1));
+                        break;
+                    case "E":
+                        addStatus("終了キーが押されました。処理を停止します。\n");
+                        runningFlag = false;
+                        break;
+                    default:
+                        addStatus("未対応のステータスを受信しました。\n");
+                        sendCommand("I\r");
+                }
+            } else {
+                readDataChk();
+            }
+        } else {
+            readDataChk();
+        }
+    }
+}
+</script>
+</head>
+
+<body>
+    <h1 id="titleDisp">
+        AP-3100シリーズ テスト
+    </h1>
+    <p id="settingDisp">
+        <input type="checkbox" id="settingAll" onchange="settingAllChange()" checked>
+        <b>各種設定</b><br>
+        <div  id="settingAllDisp" style="padding-left: 1em;">
+            <label id="serialDisp">
+                <b>シリアル通信設定</b>
+                <select id="baudRateSelect">
+                    <option value="4800">4800</option>
+                    <option value="9600">9600</option>
+                    <option value="19200">19200</option>
+                    <option value="38400" selected>38400</option>
+                    <option value="57600">57600</option>
+                    <option value="115200">115200</option>
+                </select>bps
+                <select id="bitParityStopSelect">
+                    <option value="8N1">8N1</option>
+                    <option value="8E1">8E1</option>
+                    <option value="8O1">8O1</option>
+                    <option value="7N1">7N1</option>
+                    <option value="7E1">7E1</option>
+                    <option value="7O1">7O1</option>
+                </select>フロー制御
+                <select id="flowSelect">
+                    <option value="none">None</option>
+                    <option value="hardware">Hard</option>
+                </select>
+                　
+                <select id="encode">
+                    <option value="SJIS">SJIS</option>
+                    <option value="UTF8">UTF8</option>
+                </select>
+            </label>
+            <br>
+            <label id="modeDisp">
+                <b>読取設定</b>
+                <select id="mode" onchange="modeChange()">
+                    <option value="0">QR</option>
+                    <option value="1">RFID</option>
+                    <option value="2">QR+RFID</option>
+                </select>
+                　桁数<input type="number" id="digits" style="width: 4em;" onchange="digitsChange()" min="0" max="9999">
+                <input type="checkbox" id="duplicateErr" onchange="duplicateErrChange()">
+                重複エラー
+                <input type="checkbox" id="duplicateIgnore" onchange="duplicateIgnoreChange()">
+                重複無視
+                <span  id="rfidDisp" style="display: none;">
+                    　RFID 開始ブロック<input type="number" id="start" style="width: 3em;" onchange="rfidChange()" min="0" max="98" value="0">
+                    ブロック数<input type="number" id="block" style="width: 3em;" onchange="rfidChange()" min="0" max="98" value="0">
+                    <input type="checkbox" id="uid" onchange="uidChange()">
+                    UID
+                    <span id="delimiterDisp">
+                        　区切文字
+                        <input type="text" id="delimiter" size="2" value=",">
+                    </span>
+                </span>
+            </label>
+            <br>
+            <label id="commandDisp">
+                <b>動作設定コマンド</b>
+                <input type="text" size="40" id="command" placeholder="カンマ区切りで複数指定。CRコードは\rと入力" onchange="commandChange()">
+                <button onclick="sendClick()">Send</button>
+            </label>
+        </div>
+    </p>
+
+    <p id="addonDisp" style="display: none;">
+        <b>拡張機能</b>
+        <select id="addonSelect" onchange="addonSelectChange()">
+            <option value=""></option>
+        </select>
+    </p>
+
+    <p id="startProcessDisp">
+        <b>処理開始</b>
+        <button onclick="openClick()">Port Open</button>
+        <button onclick="closeClick()">Close</button>
+        　
+        <button style="background-color: lightgreen;" onclick="autoClick()">
+            自動スタート</button>
+        <button style="background-color: lightblue;" onclick="manualClick()">
+            手動スタート</button>
+        　
+        <button style="background-color: lightcoral;" onclick="stopClick()">
+            停止</button>
+    </p>
+
+    <p id="readDataDisp">
+        <b>読取データ</b>　
+        OK=<input type="text" id="readOk" size="5" readonly>
+        ERR=<input type="text" id="readErr" size="5" readonly>
+        <input type="checkbox" id="readDataEdit" onchange="readDataEditChange()">データ編集
+        <br>
+        <textarea cols="80" rows="10" id="readDataArea" style="width: 100%; resize: vertical;" readonly></textarea>
+        <br>
+        <button onclick="outputClick()">読取データ出力</button>
+    </p>
+
+    <p id="statusDisp">
+        <b>ステータスログ</b>　
+        <button onclick="statusClearClick()">クリア</button>
+        <br>
+        <textarea cols="80" rows="5" id="statusArea" style="width: 100%; resize: vertical;" readonly></textarea>
+    </p>
+
+    <p id="debugDisp">
+        <input type="checkbox" id="debug" onchange="debugChange()">
+        <b>デバッグ</b>
+        <span id="debugArea" style="display: none;">
+            仮想受信データ
+            <select id="receiveHead">
+                <option value=""></option>
+                <option value="1B">ESC</option>
+            </select>
+            <input type="text" id="receive">
+            <button onclick="receiveClick()">+CR Receive</button>
+        </span>
+    </p>
+
+    <!-- 設定ファイル読込 -->
+    <script src="ap3100config.js"></script>
+</body>
+</html>
